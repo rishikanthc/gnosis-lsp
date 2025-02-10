@@ -2,6 +2,7 @@
 
 mod db;
 mod document_symbols;
+mod hover_preview;
 mod server;
 mod workspace_symbols;
 

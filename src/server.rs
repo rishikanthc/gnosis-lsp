@@ -1,5 +1,6 @@
 // src/server.rs
 
+use crate::hover_preview;
 use async_trait::async_trait;
 use log::info;
 use std::collections::HashMap;
@@ -45,6 +46,7 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec!["[".into()]),
                     ..Default::default()
                 }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 // Advertise our document symbol provider.
                 document_symbol_provider: Some(OneOf::Left(true)),
                 // Advertise workspace symbol support.
@@ -152,6 +154,32 @@ impl LanguageServer for Backend {
         let query = params.query;
         let symbols = workspace_symbols::get_workspace_symbols(self.db.clone(), &query).await;
         Ok(Some(symbols))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>, tower_lsp::jsonrpc::Error> {
+        let position = params.text_document_position_params.position;
+        let uri = params.text_document_position_params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let text = match docs.get(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Get the text line at the hover position.
+        let lines: Vec<&str> = text.lines().collect();
+        if (position.line as usize) >= lines.len() {
+            return Ok(None);
+        }
+        let line = lines[position.line as usize];
+
+        // Use the dedicated module to get a hover preview.
+        if let Some(hover) =
+            hover_preview::get_hover_preview(line, position.character as usize, self.db.as_ref())
+                .await
+        {
+            return Ok(Some(hover));
+        }
+        Ok(None)
     }
 }
 
