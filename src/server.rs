@@ -1,5 +1,6 @@
 // src/server.rs
 
+use crate::goto_definition;
 use crate::hover_preview;
 use async_trait::async_trait;
 use log::info;
@@ -51,6 +52,7 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 // Advertise workspace symbol support.
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -180,6 +182,35 @@ impl LanguageServer for Backend {
             return Ok(Some(hover));
         }
         Ok(None)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>, tower_lsp::jsonrpc::Error> {
+        // Get the document URI and position.
+        let pos = params.text_document_position_params.position;
+        let uri = params.text_document_position_params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let text = match docs.get(&uri) {
+            Some(text) => text,
+            None => return Ok(None),
+        };
+        // Get the text line at the given position.
+        let lines: Vec<&str> = text.lines().collect();
+        if (pos.line as usize) >= lines.len() {
+            return Ok(None);
+        }
+        let line = lines[pos.line as usize];
+        // Use our goto-definition module to get a Location.
+        if let Some(loc) =
+            goto_definition::get_goto_definition(line, pos.character as usize, self.db.as_ref())
+                .await
+        {
+            Ok(Some(GotoDefinitionResponse::Scalar(loc)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
