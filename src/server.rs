@@ -2,10 +2,13 @@
 
 use crate::goto_definition;
 use crate::hover_preview;
+use crate::link_references;
+use crate::link_references::HybridIndex;
 use async_trait::async_trait;
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -19,14 +22,20 @@ pub struct Backend {
     pub db: Arc<db::Database>,
     // A simple document store to cache text for open documents.
     pub documents: Mutex<HashMap<Url, String>>,
+    pub ref_index: Arc<link_references::HybridIndex>,
 }
 
 impl Backend {
-    pub fn new(client: Client, db: Arc<db::Database>) -> Self {
+    pub fn new(
+        client: Client,
+        db: Arc<db::Database>,
+        ref_index: Arc<link_references::HybridIndex>,
+    ) -> Self {
         Self {
             client,
             db,
             documents: Mutex::new(HashMap::new()),
+            ref_index,
         }
     }
 }
@@ -53,6 +62,17 @@ impl LanguageServer for Backend {
                 // Advertise workspace symbol support.
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                    InlayHintOptions {
+                        work_done_progress_options: WorkDoneProgressOptions {
+                            work_done_progress: Some(false),
+                        },
+                        resolve_provider: Some(false),
+                    },
+                ))),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -212,16 +232,152 @@ impl LanguageServer for Backend {
             Ok(None)
         }
     }
+
+    async fn code_lens(
+        &self,
+        params: CodeLensParams,
+    ) -> Result<Option<Vec<CodeLens>>, tower_lsp::jsonrpc::Error> {
+        let uri = params.text_document.uri;
+        let local_path = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()));
+        if local_path.is_none() {
+            return Ok(None);
+        }
+        let local_path = local_path.unwrap();
+
+        let file_infos = match self.db.get_all_file_infos().await {
+            Ok(infos) => infos,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Error retrieving file infos: {}", e),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        let maybe_info = file_infos.into_iter().find(|f| f.path == local_path);
+        if maybe_info.is_none() {
+            return Ok(None);
+        }
+        let info = maybe_info.unwrap();
+
+        // For the workspace root, we assume a WORKSPACE_ROOT env var or default to the current directory.
+        let _workspace_root = std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| ".".to_string());
+
+        // Use the hybrid index to get the reference count.
+        let count = self
+            .ref_index
+            .get_references_count(&info.virtual_path)
+            .await
+            .unwrap_or(0);
+
+        let code_lens = CodeLens {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            command: Some(Command {
+                title: format!("Referenced {} times", count),
+                command: "dummy.showReferences".to_string(),
+                arguments: None,
+            }),
+            data: None,
+        };
+
+        Ok(Some(vec![code_lens]))
+    }
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> Result<Option<Vec<InlayHint>>, tower_lsp::jsonrpc::Error> {
+        // For simplicity, we ignore the requested range and always return a hint at the top.
+        // In a more elaborate solution you might filter based on params.range.
+        let uri = params.text_document.uri;
+        // Convert the URI to a local file path.
+        let local_path = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()));
+        if local_path.is_none() {
+            return Ok(None);
+        }
+        let local_path = local_path.unwrap();
+
+        // Query your database to find the file record by matching the local path.
+        let file_infos = match self.db.get_all_file_infos().await {
+            Ok(infos) => infos,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Error retrieving file infos: {}", e),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        let maybe_info = file_infos.into_iter().find(|f| f.path == local_path);
+        if maybe_info.is_none() {
+            return Ok(None);
+        }
+        let info = maybe_info.unwrap();
+
+        // Get the reference count using your hybrid index.
+        let count = self
+            .ref_index
+            .get_references_count(&info.virtual_path)
+            .await
+            .unwrap_or(0);
+
+        // Create an inlay hint. We place it at the very top (line 0, character 0).
+        let hint = InlayHint {
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+            // Use the simple string variant for the label.
+            label: InlayHintLabel::String(format!("Referenced {} times", count)),
+            // Optionally, choose a kind. Here we use 'Other' since there’s no dedicated type.
+            kind: None,
+            tooltip: None,
+            text_edits: None,
+            data: None,
+            padding_left: None,
+            padding_right: None,
+        };
+
+        Ok(Some(vec![hint]))
+    }
 }
 
 pub async fn run() {
     let db_instance = db::Database::new().await;
     let db_arc = Arc::new(db_instance);
 
+    // Determine the workspace root.
+    let workspace_root = std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| ".".to_string());
+    // Create the hybrid index with a freshness threshold (e.g., 10 minutes).
+    let ref_index = HybridIndex::new(workspace_root, Duration::from_secs(600));
+    let ref_index = Arc::new(ref_index);
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
     let (service, socket) =
-        LspService::build(|client| Backend::new(client, db_arc.clone())).finish();
+        LspService::build(|client| Backend::new(client, db_arc.clone(), ref_index.clone()))
+            .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
